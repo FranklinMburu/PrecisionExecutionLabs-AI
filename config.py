@@ -37,6 +37,17 @@ TP_TRAILING_ENABLE = True
 TP_TRAILING_START_R = 2.0      # When to start pushing TP further
 TP_TRAILING_STEP_R = 1.0       # How much to push TP by
 
+# INTELLIGENT TRAILING STOP SETTINGS
+TRAILING_STOP_ENABLE = True
+TRAILING_STOP_MODE = "FIXED"    # FIXED | PERCENTAGE | VOLATILITY
+TRAILING_STOP_FIXED_POINTS = 150 # Distance in points (e.g. 150 points = 15 pips)
+TRAILING_STOP_PERCENT = 0.001   # 0.1% distance
+TRAILING_STOP_VOL_ATR_MULT = 1.5 # ATR Multiplier for volatility mode
+TRAILING_STOP_MOMENTUM_SENSITIVITY = 0.5 # 0.0 - 1.0 (Higher = reacts faster to trend strength)
+TRAILING_STOP_MIN_PROFIT_R = 0.5 # Only trail once we reached 0.5R profit
+TRAILING_STOP_CONFIRMATION_MINUTES = 1 # High timeframe intelligence window
+TRAILING_STOP_STEP_POINTS = 30  # Minimum movement to update broker SL (reduce API noise)
+
 # MARKET FILTERS
 MIN_RANGE_POINTS = 200         # Filter out "dead" markets
 MAX_SPREAD_RATIO = 0.2         # Max spread as % of range

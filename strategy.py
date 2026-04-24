@@ -489,9 +489,19 @@ class StraddleStrategy:
                 "risk_at_entry": risk_at_entry,
                 "tp": pos.tp,
                 "breakeven_moved": False,
-                "partial_closed": False
+                "partial_closed": False,
+                "highest_price": live_price if pos.type == mt5.POSITION_TYPE_BUY else 0.0,
+                "lowest_price": live_price if pos.type == mt5.POSITION_TYPE_SELL else 999999.0,
+                "last_trail_time": 0
             }
             self.save_state()
+
+        if self.active_trade['type'] == "BUY":
+            if live_price > self.active_trade['highest_price']:
+                self.active_trade['highest_price'] = live_price
+        else:
+            if live_price < self.active_trade['lowest_price']:
+                self.active_trade['lowest_price'] = live_price
 
         # Fake Breakout Logic (Buffered)
         r_dist_val = abs(self.active_trade['entry'] - self.active_trade['initial_sl'])
@@ -527,7 +537,90 @@ class StraddleStrategy:
         profit_points = abs(live_price - self.active_trade['entry'])
         r_multiple = profit_points / r_dist_val
 
-        # 3. Take Profit Management (Institutional Grade Trailing)
+        # 3. INTELLIGENT TRAILING STOP ENGINE
+        # Activation: Only trail if min profit R is reached AND one leg has been purged (oco_lock)
+        is_trail_active = getattr(config, 'TRAILING_STOP_ENABLE', False)
+        if is_trail_active and self.oco_lock and r_multiple >= getattr(config, 'TRAILING_STOP_MIN_PROFIT_R', 0.5):
+            
+            # Layer A: 1-Minute Intelligence Filter (Intelligence Layer)
+            candles_m1 = self.connector.get_m1_candles(10)
+            vol_mult = 1.0
+            momentum_mult = 1.0
+            confirmed_breakout = False
+            
+            if candles_m1 is not None and len(candles_m1) >= 5:
+                # 1. Volatility (ATR-based)
+                tr = [max(c['high'] - c['low'], abs(c['high'] - candles_m1[i-1]['close'])) for i, c in enumerate(candles_m1) if i > 0]
+                atr = sum(tr) / len(tr)
+                
+                # 2. Trend Strength Analysis
+                last_3 = candles_m1[-3:]
+                trend_dir = 0
+                for c in last_3:
+                    if self.active_trade['type'] == "BUY" and c['close'] > c['open']: trend_dir += 1
+                    if self.active_trade['type'] == "SELL" and c['close'] < c['open']: trend_dir += 1
+                
+                # Slower/Wider trail in weak trends, tighter in blow-off moves
+                sensitivity = getattr(config, 'TRAILING_STOP_MOMENTUM_SENSITIVITY', 0.5)
+                if trend_dir == 3: # Strong momentum
+                    momentum_mult = 0.85 + (1.0 - 0.85) * (1.0 - sensitivity) # Tighter
+                elif trend_dir <= 1: # Choppy / Counter-trend
+                    momentum_mult = 1.2 + (1.5 - 1.2) * sensitivity # Wider
+
+                # Volatility Adaptation
+                if self.avg_candle_body > 0:
+                    vol_ratio = atr / self.avg_candle_body
+                    vol_mult = max(0.7, min(1.8, vol_ratio)) # High vol = widen (safety), Low vol = tighten
+
+                # 3. Breakout Confirmation Rule (Anti-Spike Filter)
+                # Only "accept" the new highest_price if price is above the last 1min high/low + buffer
+                m1_threshold = candles_m1[-1]['high'] if self.active_trade['type'] == "BUY" else candles_m1[-1]['low']
+                threshold_buffer = 10 * self.connector.point
+                
+                if (self.active_trade['type'] == "BUY" and live_price > m1_threshold + threshold_buffer) or \
+                   (self.active_trade['type'] == "SELL" and live_price < m1_threshold - threshold_buffer):
+                    confirmed_breakout = True
+
+            # Execution Layer: Compute Trial SL
+            mode = getattr(config, 'TRAILING_STOP_MODE', 'FIXED')
+            base_dist = 0.0
+            if mode == "FIXED":
+                base_dist = getattr(config, 'TRAILING_STOP_FIXED_POINTS', 150) * self.connector.point
+            elif mode == "PERCENTAGE":
+                base_dist = live_price * getattr(config, 'TRAILING_STOP_PERCENT', 0.001)
+            elif mode == "VOLATILITY":
+                # Fallback to fixed if ATR calc failed
+                base_dist = atr * getattr(config, 'TRAILING_STOP_VOL_ATR_MULT', 1.5) if 'atr' in locals() else (150 * self.connector.point)
+
+            # Apply Intelligence Multipliers
+            final_dist = base_dist * vol_mult * momentum_mult
+            
+            # Anti-Flush Rule: Never trail closer than 0.3R of the current range
+            min_safety_dist = (self.current_range['high'] - self.current_range['low']) * 0.3 if self.current_range else 0
+            final_dist = max(final_dist, min_safety_dist)
+
+            new_trail_sl = 0.0
+            if self.active_trade['type'] == "BUY":
+                new_trail_sl = self.active_trade['highest_price'] - final_dist
+            else:
+                new_trail_sl = self.active_trade['lowest_price'] + final_dist
+            
+            # Movement Validation
+            is_better = (new_trail_sl > pos.sl) if self.active_trade['type'] == "BUY" else (new_trail_sl < pos.sl or pos.sl == 0)
+            
+            # Step Filter (Price & Time Cooldown)
+            step_pts = getattr(config, 'TRAILING_STOP_STEP_POINTS', 30) * self.connector.point
+            price_step_met = abs(new_trail_sl - pos.sl) >= step_pts if pos.sl > 0 else True
+            time_cooldown_met = (time.time() - self.active_trade.get('last_trail_time', 0)) > 5 # 5-sec cooldown
+            
+            # Final Decision: Better direction + Price Step + Time Cooldown + Breakout Confirmation
+            if is_better and price_step_met and time_cooldown_met and confirmed_breakout:
+                self.add_log(f"TRAIL: Advancing to {new_trail_sl:.5f} (Confirmed Breakout | Vol: {vol_mult:.2f}x | Dist: {final_dist/self.connector.point:.0f}pts)")
+                self.connector.modify_position(pos.ticket, new_trail_sl, pos.tp)
+                self.active_trade['last_trail_time'] = time.time()
+                self.save_state()
+
+        # 4. Take Profit Management (Institutional Grade Trailing)
         if hasattr(config, 'TP_TRAILING_ENABLE') and config.TP_TRAILING_ENABLE and self.active_trade['partial_closed']:
             if r_multiple >= config.TP_TRAILING_START_R:
                 # Maintain a buffer between live price and TP to 'ride' the expansion
