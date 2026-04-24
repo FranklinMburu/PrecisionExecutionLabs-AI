@@ -1,16 +1,11 @@
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # MT5 CREDENTIALS
 MT5_LOGIN = int(os.getenv("MT5_LOGIN", 0))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER = os.getenv("MT5_SERVER", "")
-SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSD")
-
-RANGE_LOOKBACK = 6
-BUFFER_POINTS = 60
+MT5_SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSD")
+SYMBOL = MT5_SYMBOL
 MAGIC_NUMBER = 123456
 LOOP_SLEEP = 0.5
 
