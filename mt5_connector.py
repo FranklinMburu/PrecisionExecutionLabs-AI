@@ -303,10 +303,26 @@ class MT5Connector:
         return round(round(volume / step) * step, precision)
 
     def get_history_deals(self, ticket):
-        return []
+        if self.mock_mode: return []
+        
+        # Look back 24 hours for deals related to this position ticket
+        from datetime import datetime, timedelta
+        from_date = datetime.now() - timedelta(days=1)
+        to_date = datetime.now() + timedelta(days=1)
+        
+        deals = mt5.history_deals_get(from_date, to_date, position=ticket)
+        if deals is None:
+            print(f"MT5: history_deals_get failed for ticket {ticket}. Error: {mt5.last_error()}")
+            return []
+        return deals
 
     def get_position_filled_volume(self, ticket):
         if self.mock_mode:
             for p in self._mock_positions:
                 if p.ticket == ticket: return p.volume
+            return 0.0
+            
+        pos = mt5.positions_get(ticket=ticket)
+        if pos and len(pos) > 0:
+            return pos[0].volume
         return 0.0

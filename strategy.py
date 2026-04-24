@@ -117,6 +117,21 @@ class StraddleStrategy:
             self.spread_history.pop(0)
         self.avg_spread = sum(self.spread_history) / len(self.spread_history)
 
+    def calculate_dynamic_buffer(self, range_pts):
+        # Range size determines buffer percentage
+        if range_pts < 500:
+            buffer_pts = range_pts * 0.20    # 20% for small ranges (noise protection)
+        elif range_pts < 2000:
+            buffer_pts = range_pts * 0.15    # 15% for medium ranges
+        else:
+            buffer_pts = range_pts * 0.12    # 12% for large ranges (tight entries)
+
+        # Enforce constraints
+        buffer_pts = max(buffer_pts, 15)                    # Minimum 15 points
+        buffer_pts = min(buffer_pts, range_pts * 0.25)     # Maximum 25% of range
+
+        return buffer_pts
+
     def calculate_lot_size(self, entry, sl):
         acc = self.connector.get_account()
         sym_info = self.connector.get_symbol_info()
@@ -128,30 +143,19 @@ class StraddleStrategy:
         # Guard: If equity is extremely low, return minimum lot
         if effective_basis < 10: return sym_info.volume_min 
 
-        # Risk amount based on equity and risk multiplier
-        current_risk_pct = getattr(config, 'RISK_PER_TRADE_PERCENT', 1.0) / 100
-        risk_amount = effective_basis * current_risk_pct * self.risk_multiplier
-        
-        # Apply slippage factor (Assume actual loss could be 20% worse than SL in news)
-        protected_risk_amount = risk_amount / 1.2 
+        # Risk amount based on equity and risk buffer
+        # config.RISK_PER_TRADE = 0.02 (2%)
+        risk_amount = (effective_basis * config.RISK_PER_TRADE * self.risk_multiplier) / config.SLIPPAGE_RISK_BUFFER
         
         sl_dist = abs(entry - sl)
         if sl_dist == 0: return sym_info.volume_min
         
         # Standard FX/Metal lot formula: Lot = Risk / (Distance * Contract Size)
-        raw_lot = protected_risk_amount / (sl_dist * sym_info.trade_contract_size)
+        raw_lot = risk_amount / (sl_dist * sym_info.trade_contract_size)
         
         # Clamp to broker limits
         lot = max(sym_info.volume_min, min(raw_lot, sym_info.volume_max))
         
-        # Margin Check: Ensure we don't use more than 50% of free margin
-        # Estimated margin (simplified assuming leverage 1:30)
-        est_margin = (lot * sym_info.trade_contract_size * entry) / 30
-        if est_margin > acc.margin_free * 0.5:
-             lot = (acc.margin_free * 0.5) / (sym_info.trade_contract_size * entry / 30)
-             lot = max(sym_info.volume_min, lot)
-
-        print(f"Audit: Basis {effective_basis:.2f} | Risk $: {risk_amount:.2f} | Final Lot: {lot}")
         return self.connector.round_volume(lot)
 
     def track_drawdown(self, equity):
@@ -227,131 +231,93 @@ class StraddleStrategy:
         acc = self.connector.get_account()
         if not acc: return False
         
-        # Equity sync delay buffer
+        # 1. Equity & Drawdown Check
         effective_equity = min(acc.equity, acc.balance)
         self.track_drawdown(effective_equity)
         if self.system_halted: return False
 
-        # MARKET SHOCK DETECTION & STABILIZATION
+        # 2. Market Shock Detection
         candles_m1 = self.connector.get_m1_candles(10)
         if candles_m1 is not None and len(candles_m1) >= 10:
             bodies = [abs(c['close'] - c['open']) for c in candles_m1]
             self.avg_candle_body = sum(bodies) / len(bodies)
             last_body = bodies[-1]
             
-            # Detect shock
-            if last_body > 3.0 * self.avg_candle_body:
-                self.add_log(f"SHOCK: Volatility spike ({last_body:.2f} vs {self.avg_candle_body:.2f}) → Stabilization active.")
+            if last_body > config.MARKET_SHOCK_MULTIPLIER * self.avg_candle_body:
+                self.add_log(f"MARKET SHOCK DETECTED → Cooldown active.")
                 self.shock_mode = True
                 self.shock_cooldown = config.SHOCK_STABILIZATION_CYCLES
             
         if self.shock_cooldown > 0:
-            # Dynamic Shock Recovery: Require volatility to be returning to normal
-            if self.avg_candle_body > 0 and candles_m1 is not None:
-                last_vol = abs(candles_m1[-1]['close'] - candles_m1[-1]['open'])
-                if last_vol > 1.5 * self.avg_candle_body:
-                    print("Shock Recovery Delayed: Volatility still high.")
-                    return False
-            
             self.shock_cooldown -= 1
             if self.shock_cooldown == 0: 
-                self.add_log("SHOCK: Stabilization complete. Resuming scanner.")
+                self.add_log("SHOCK: Stabilization complete.")
                 self.shock_mode = False
             return False
 
-        # Daily Loss
+        # 3. Daily Loss Limit
         if (self.day_start_balance - effective_equity) / self.day_start_balance >= config.DAILY_LOSS_LIMIT:
             print("CRITICAL: Daily Loss Limit. Stopping.")
             return False
 
-        # TRUE Exposure Control
+        # 4. Open Risk Exposure Control
         risk_pct = self.calculate_total_risk()
         if risk_pct >= config.MAX_TOTAL_EXPOSURE:
             print(f"Exposure at limit ({risk_pct:.2%}). Skip.")
             return False
 
+        # 5. Minimum Range Size
         if range_points < config.MIN_RANGE_POINTS:
             return False
             
-        # Spread vs Progress: Hard friction filter (Institutional upgrade)
-        tp_dist = range_points * 3 # Estimated TP distance based on straddle setup
+        # 6. Spread vs Profit Ratio (Friction Shield)
         tick = self.connector.get_tick()
         if tick:
             spread_pts = (tick.ask - tick.bid) / self.connector.point
-            friction_ratio = spread_pts / tp_dist if tp_dist > 0 else 1.0
+            tp_dist_est = range_points * 3 
+            friction_ratio = spread_pts / tp_dist_est if tp_dist_est > 0 else 1.0
             if friction_ratio > config.MAX_FRICTION_RATIO:
-                print(f"FRICTION SHIELD: Spread ({spread_pts:.0f} pts) is too large for TP ({tp_dist:.0f} pts). Skip.")
+                print(f"Friction Shield: Spread/TP ratio too high ({friction_ratio:.2f}). Skip.")
                 return False
 
-        # Dead Market Filter: Range compression detection
+        # 7. Market Compression Detection
         self.range_history.append(range_points)
         if len(self.range_history) > config.RANGE_SHRINK_CHECK_WINDOW:
             self.range_history.pop(0)
 
-        # Breakout Quality: Volatility Expansion Check
-        # Only enter if current range is significantly larger than the average of recent compressed ranges
         if len(self.range_history) == config.RANGE_SHRINK_CHECK_WINDOW:
-            avg_range = sum(self.range_history) / len(self.range_history)
-            # If current range is widening vs average → Potential breakout start
-            # If current range is shrinking → Compression phase (wait for expansion)
             if all(self.range_history[i] < self.range_history[i-1] for i in range(1, len(self.range_history))):
-                print("Market Compression Detected → Waiting for expansion.")
+                print("Market Compression Detected → Wait for expansion.")
                 return False
                 
-        # Spread & Rollover Guard
-        tick = self.connector.get_tick()
+        # 8. Spread Spike Filter
         if tick:
-            # Rollover hour filter
-            hour = time.gmtime(tick.time).tm_hour
-            if hour in [21, 22, 23]:
-                return False
-
             spread_pts = (tick.ask - tick.bid) / self.connector.point
             self.update_spread_rolling(spread_pts)
             
-            # Spread-to-Range Normalization
             spread_ratio = spread_pts / range_points
             if spread_ratio > config.MAX_SPREAD_RATIO:
-                print(f"Spread logic: Ratio {spread_ratio:.2f} exceeds {config.MAX_SPREAD_RATIO}. Skip.")
                 return False
 
-            # Warm-up baseline check
-            if len(self.spread_history) < 10:
-                return False
-            if spread_pts > self.avg_spread * 2 and spread_ratio > 0.1:
-                print(f"Spread Spike Detected ({spread_pts:.0f} pts vs Avg: {self.avg_spread:.0f}).")
+            if len(self.spread_history) >= 10:
+                if spread_pts > self.avg_spread * 2:
+                    print("Spread spike detected → Skip.")
+                    return False
+
+        # 9. Rollover Hours Filter
+        if tick:
+            hour = time.gmtime(tick.time).tm_hour
+            if hour in config.ROLLOVER_HOURS_UTC:
                 return False
 
-        # Adaptive Cooldown
-        if self.cooldown_counter > 0:
-            self.cooldown_counter -= 1
-            return False
-
-        # Expectancy & Variance Kill Switch
-        count = self.stats["total_trades"]
-        if count >= config.VALIDATION_WINDOW:
+        # 10. Expectancy & Performance Kill Switch
+        if self.stats["total_trades"] >= config.EXPECTANCY_VALIDATION_WINDOW:
             exp = self.calculate_expectancy()
-            # Confidence Weighting (Institutional upgrade)
-            confidence = min(1.0, count / 100)
-            adjusted_exp = exp * confidence
-            
-            std_r = self.calculate_std_r()
-            
-            # Instability Check
-            if count >= 30 and std_r > 2.5:
-                print(f"Unstable Performance (std_r: {std_r:.2f} > 2.5) → Halting.")
+            if exp <= 0:
+                print(f"Negative Expectancy ({exp:.2f}) → System halted.")
                 self.system_halted = True
                 self.save_state()
                 return False
-
-            if count < 100:
-                if adjusted_exp < -0.2: self.system_halted = True
-            else:
-                if adjusted_exp <= 0: self.system_halted = True
-        
-        if self.system_halted: 
-            self.save_state()
-            return False
 
         return True
 
@@ -507,37 +473,67 @@ class StraddleStrategy:
         r_dist_val = abs(self.active_trade['entry'] - self.active_trade['initial_sl'])
         if r_dist_val <= 0: return
         
-        # Spread vs Progress: If spread is too large vs TP, reconsider
-        tp_dist = abs(self.active_trade['tp'] - self.active_trade['entry'])
-        spread_pts = (tick.ask - tick.bid) / self.connector.point
-        if not self.active_trade['partial_closed'] and (spread_pts * self.connector.point) > (0.2 * tp_dist):
-            print(f"Friction Warning: Spread is {spread_pts:.0f} pts while TP is nearby.")
-
-        buffer = 0.2 * r_dist_val
+        # Get recent candles
         candles = self.connector.get_m1_candles(3)
-        momentum_ratio = 0.0
         if candles is not None and len(candles) >= 3:
-            avg_body = sum(abs(c['close'] - c['open']) for c in candles) / len(candles)
-            momentum_ratio = avg_body / r_dist_val if r_dist_val > 0 else 0
+            last_closed = candles[-1]['close']
+            
+            # Use adaptive buffer (same as entry buffer)
+            entry_buffer = self.active_trade_meta.get('buffer_size', 100)
+            price_buffer = entry_buffer * self.connector.point
             
             if self.current_range:
-                last_closed = candles[-1]
-                if self.active_trade['type'] == "BUY" and last_closed['close'] < (self.current_range['high'] - buffer):
-                    print("Fake breakout (buffered) → closing.")
+                if self.active_trade['type'] == "BUY" and last_closed < (self.current_range['high'] - price_buffer):
+                    self.add_log("Fake breakout detected → Exit trade.")
                     self.connector.close_position(pos.ticket, pos.type, pos.volume)
                     return
-                elif self.active_trade['type'] == "SELL" and last_closed['close'] > (self.current_range['low'] + buffer):
-                    print("Fake breakout (buffered) → closing.")
+                elif self.active_trade['type'] == "SELL" and last_closed > (self.current_range['low'] + price_buffer):
+                    self.add_log("Fake breakout detected → Exit trade.")
                     self.connector.close_position(pos.ticket, pos.type, pos.volume)
                     return
 
         if is_lagging: return # End of critical section
 
-        # Continuous Trailing Logic
+        # Continuous Trailing Logic (Institutional Ladder)
         profit_points = abs(live_price - self.active_trade['entry'])
         r_multiple = profit_points / r_dist_val
 
-        # 3. INTELLIGENT TRAILING STOP ENGINE
+        # At 1R: Partial close 50% and move to Breakeven
+        if not self.active_trade['partial_closed'] and r_multiple >= 1.0:
+            current_vol = self.connector.get_position_filled_volume(pos.ticket)
+            if current_vol <= 0: current_vol = pos.volume 
+            
+            half_vol = self.connector.round_volume(current_vol / 2)
+            self.add_log(f"1R Target Hit: Closing {half_vol} and moving to BE.")
+            res_close = self.connector.close_position(pos.ticket, pos.type, half_vol)
+            res_mod = self.connector.modify_position(pos.ticket, self.active_trade['entry'], pos.tp)
+            
+            if res_close:
+                self.active_trade['partial_closed'] = True
+                if res_mod: self.active_trade['breakeven_moved'] = True
+            self.save_state()
+
+        # Progression Trailing
+        if self.active_trade['partial_closed']:
+            new_sl = 0.0
+            move_sl = False
+            
+            if r_multiple >= 1.5 and r_multiple < 2.0:
+                # Move to +0.5R
+                new_sl = self.active_trade['entry'] + (0.5 * r_dist_val) if self.active_trade['type'] == "BUY" else self.active_trade['entry'] - (0.5 * r_dist_val)
+                move_sl = True
+            elif r_multiple >= 2.0:
+                # Move to +1.2R
+                new_sl = self.active_trade['entry'] + (1.2 * r_dist_val) if self.active_trade['type'] == "BUY" else self.active_trade['entry'] - (1.2 * r_dist_val)
+                move_sl = True
+                
+            if move_sl:
+                is_better = (new_sl > pos.sl) if self.active_trade['type'] == "BUY" else (new_sl < pos.sl or pos.sl == 0)
+                if is_better:
+                    self.add_log(f"Trailing Progression: SL to {new_sl:.5f} ({r_multiple:.2f}R)")
+                    self.connector.modify_position(pos.ticket, new_sl, pos.tp)
+
+        # 3. INTELLIGENT TRAILING STOP ENGINE (Optional/Advanced)
         # Activation: Only trail if min profit R is reached AND one leg has been purged (oco_lock)
         is_trail_active = getattr(config, 'TRAILING_STOP_ENABLE', False)
         if is_trail_active and self.oco_lock and r_multiple >= getattr(config, 'TRAILING_STOP_MIN_PROFIT_R', 0.5):
@@ -777,8 +773,22 @@ class StraddleStrategy:
 
         # 3. Setup
         self.current_range = {"high": range_high, "low": range_low}
-        buy_p = range_high + (config.BUFFER_POINTS * self.connector.point)
-        sell_p = range_low - (config.BUFFER_POINTS * self.connector.point)
+        
+        # Calculate dynamic buffer
+        buffer_pts_dynamic = self.calculate_dynamic_buffer(r_pts)
+        buffer_price = buffer_pts_dynamic * self.connector.point
+        
+        # Set entry points
+        buy_p = range_high + buffer_price      # BUY entry above range
+        sell_p = range_low - buffer_price      # SELL entry below range
+
+        # Set Stop Loss points
+        buy_sl = range_low                      # BUY's SL at range bottom
+        sell_sl = range_high                    # SELL's SL at range top
+
+        # Set Take Profit points (3R)
+        buy_tp = buy_p + (buy_p - buy_sl) * 3
+        sell_tp = sell_p - (sell_sl - sell_p) * 3
         
         # Meta persistence with range recovery
         self.active_trade_meta = {
@@ -787,17 +797,42 @@ class StraddleStrategy:
             "range_high": range_high,
             "range_low": range_low,
             "order_timestamp": time.time(),
-            "expected_order_count": 2
+            "expected_order_count": 2,
+            "buffer_size": buffer_pts_dynamic
         }
         self.save_state()
 
-        lot = self.calculate_lot_size(buy_p, range_low)
+        lot = self.calculate_lot_size(buy_p, buy_sl)
         tick = self.connector.get_tick()
         spread_pts = (tick.ask - tick.bid) / self.connector.point
         dev = int(spread_pts) + 10
         
         print(f"--- SENSING BREAKOUT ---")
-        print(f"Range: {range_low:.2f} - {range_high:.2f} ({r_pts:.0f} pts)")
+        print(f"Range: {range_low:.2f} - {range_high:.2f} ({r_pts:.0f} pts) | Buffer: {buffer_pts_dynamic:.1f} pts")
+        
+        # Place both orders
+        res_buy = self.connector.place_order(
+            order_type=mt5.ORDER_TYPE_BUY_STOP,
+            price=buy_p,
+            sl=buy_sl,
+            tp=buy_tp,
+            lot=lot,
+            deviation=dev
+        )
+        
+        res_sell = self.connector.place_order(
+            order_type=mt5.ORDER_TYPE_SELL_STOP,
+            price=sell_p,
+            sl=sell_sl,
+            tp=sell_tp,
+            lot=lot,
+            deviation=dev
+        )
+        
+        if res_buy and res_sell:
+            self.execution_lock = True
+            self.add_log(f"Straddle Placed: {lot} lots @ {buy_p:.5f} / {sell_p:.5f}")
+            self.save_state()
         print(f"BUY STOP @ {buy_p:.2f} | SL: {range_low:.2f}")
         print(f"SELL STOP @ {sell_p:.2f} | SL: {range_high:.2f}")
         print(f"Spread: {spread_pts:.0f} | Risk: {self.risk_multiplier*100:.0f}% | LOT: {lot}")
