@@ -460,6 +460,7 @@ class StraddleStrategy:
                 "ticket": pos.ticket,
                 "type": "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL",
                 "entry": pos.price_open,
+                "entry_time": time.time(),
                 "initial_sl": pos.sl if pos.sl > 0 else (self.active_trade_meta.get('range_low') if pos.type == mt5.POSITION_TYPE_BUY else self.active_trade_meta.get('range_high')),
                 "risk_at_entry": risk_at_entry,
                 "tp": pos.tp,
@@ -478,28 +479,36 @@ class StraddleStrategy:
             if live_price < self.active_trade['lowest_price']:
                 self.active_trade['lowest_price'] = live_price
 
-        # Fake Breakout Logic (Buffered)
+        # Fake Breakout Logic (Buffered & Timing Aware)
         r_dist_val = abs(self.active_trade['entry'] - self.active_trade['initial_sl'])
         if r_dist_val <= 0: return
         
-        # Get recent candles
-        candles = self.connector.get_m1_candles(3)
-        if candles is not None and len(candles) >= 3:
-            last_closed = candles[-1]['close']
-            
-            # Use adaptive buffer (same as entry buffer)
-            entry_buffer = self.active_trade_meta.get('buffer_size', 100)
-            price_buffer = entry_buffer * self.connector.point
-            
-            if self.current_range and 'high' in self.current_range and 'low' in self.current_range:
-                if self.active_trade['type'] == "BUY" and last_closed < (self.current_range['high'] - price_buffer):
-                    self.add_log("Fake breakout detected → Exit trade.")
-                    self.connector.close_position(pos.ticket, pos.type, pos.volume)
-                    return
-                elif self.active_trade['type'] == "SELL" and last_closed > (self.current_range['low'] + price_buffer):
-                    self.add_log("Fake breakout detected → Exit trade.")
-                    self.connector.close_position(pos.ticket, pos.type, pos.volume)
-                    return
+        # Only check fake breakout after trade has been open for a bit (e.g. 45 seconds)
+        # to ensure at least one candle has a chance to close or price has moved.
+        trade_age = time.time() - self.active_trade.get('entry_time', 0)
+        
+        if trade_age > 45:
+            candles = self.connector.get_m1_candles(3)
+            if candles is not None and len(candles) >= 3:
+                last_closed = candles[-1]['close']
+                last_closed_time = candles[-1]['time']
+                # Use pos.time (MT5 time) for comparison with candle times
+                entry_time_mt5 = getattr(pos, 'time', 0)
+                
+                # Check if this candle actually closed AFTER we entered
+                if last_closed_time > entry_time_mt5:
+                    entry_buffer = self.active_trade_meta.get('buffer_size', 100)
+                    price_buffer = entry_buffer * self.connector.point
+                    
+                    if self.current_range and 'high' in self.current_range and 'low' in self.current_range:
+                        if self.active_trade['type'] == "BUY" and last_closed < (self.current_range['high'] - price_buffer):
+                            self.add_log(f"Fake breakout detected (M1 Close: {last_closed:.5f} < {self.current_range['high'] - price_buffer:.5f}) → Exit trade.")
+                            self.connector.close_position(pos.ticket, pos.type, pos.volume)
+                            return
+                        elif self.active_trade['type'] == "SELL" and last_closed > (self.current_range['low'] + price_buffer):
+                            self.add_log(f"Fake breakout detected (M1 Close: {last_closed:.5f} > {self.current_range['low'] + price_buffer:.5f}) → Exit trade.")
+                            self.connector.close_position(pos.ticket, pos.type, pos.volume)
+                            return
 
         if is_lagging: return # End of critical section
 
