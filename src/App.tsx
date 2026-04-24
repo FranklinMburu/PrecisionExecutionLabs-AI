@@ -138,9 +138,9 @@ export default function App() {
               )}
             </div>
             <div>
-              <h1 className="text-xl font-black text-white tracking-tighter uppercase italic">STRADDLE<span className="text-blue-500">CORE</span></h1>
+              <h1 className="text-xl font-black text-white tracking-tighter uppercase italic">PRECISION<span className="text-blue-500">EXECUTION</span>LAB AI</h1>
               <div className="flex items-center gap-2">
-                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">MT5 Institutional Engine</p>
+                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Powered by AI Trading Systems</p>
                 <span className="text-[10px] text-slate-700">|</span>
                 <p className="text-[10px] font-bold text-blue-500/80 uppercase tracking-widest">{data?.engine.symbol}</p>
               </div>

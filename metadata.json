@@ -1,5 +1,5 @@
 {
-  "name": "MT5 Straddle Engine",
+  "name": "PrecisionExecutionLabAI",
   "description": "Professional institutional straddle trading platform for MetaTrader 5 with automated range detection, OCO management, and advanced risk controls.",
   "requestFramePermissions": [],
   "majorCapabilities": []
