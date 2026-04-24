@@ -18,7 +18,8 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
-  LineChart, 
+  AreaChart,
+  Area,
   Line, 
   XAxis, 
   YAxis, 
@@ -28,6 +29,13 @@ import {
   ReferenceLine
 } from 'recharts';
 import { cn } from './lib/utils';
+
+interface TradeRecord {
+  r: number;
+  pnl: number;
+  time: number;
+  symbol: string;
+}
 
 interface EngineStatus {
   engine: {
@@ -66,12 +74,13 @@ interface EngineStatus {
   performance: {
     expectancy: number;
     std_r: number;
-    r_values: number[];
+    r_values: (number | TradeRecord)[];
     r_baseline: number;
   };
   active_trade: any | null;
   active_trade_meta: any;
   raw_orders: any[];
+  logs: string[];
 }
 
 export default function App() {
@@ -112,14 +121,35 @@ export default function App() {
     const baseline = data?.performance.r_baseline || 0;
     let runningTotal = baseline;
     
-    return values.map((val, i) => {
-      runningTotal += val;
+    const mapped = values.map((val, i) => {
+      const isRecord = typeof val === 'object';
+      const r_val = isRecord ? val.r : val;
+      const time = isRecord ? val.time : Date.now() - (values.length - i) * 60000;
+      
+      runningTotal += r_val;
+      
       return {
-        index: i,
-        r: val,
-        total: runningTotal
+        time: new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(time)),
+        sortTime: time,
+        r: r_val,
+        value: runningTotal, // This is the cumulative R
+        pair: isRecord ? val.symbol : 'XAUUSD'
       };
     });
+
+    if (mapped.length > 0) {
+      const firstTime = mapped[0].sortTime;
+      const startTime = firstTime - 60000;
+      mapped.unshift({
+        time: new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(startTime)),
+        sortTime: startTime,
+        r: 0,
+        value: baseline,
+        pair: 'START'
+      });
+    }
+
+    return mapped;
   }, [data?.performance.r_values, data?.performance.r_baseline]);
 
   if (!data && !error) {
@@ -342,27 +372,51 @@ export default function App() {
                   </div>
                   <h3 className="text-white font-black tracking-tight text-lg uppercase">Equity Progression (R)</h3>
                 </div>
+                <div className="flex items-center gap-2">
+                   <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                   <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Real-time Attribution</span>
+                </div>
               </div>
               <div className="h-[300px] w-full">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#ffffff05" />
-                    <XAxis dataKey="index" hide />
-                    <YAxis stroke="#475569" fontSize={10} />
+                  <AreaChart data={chartData}>
+                    <defs>
+                      <linearGradient id="equityGradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
+                        <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#ffffff05" vertical={false} />
+                    <XAxis 
+                      dataKey="time" 
+                      stroke="#475569" 
+                      fontSize={10} 
+                      tickLine={false} 
+                      axisLine={false}
+                      minTickGap={20}
+                    />
+                    <YAxis 
+                      stroke="#475569" 
+                      fontSize={10} 
+                      tickFormatter={(v) => `${v}R`} 
+                      tickLine={false} 
+                      axisLine={false} 
+                    />
                     <Tooltip 
                       contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #ffffff10', borderRadius: '12px' }}
-                      itemStyle={{ color: '#3b82f6', fontWeight: 'bold' }}
+                      itemStyle={{ color: '#10b981', fontWeight: 'bold' }}
+                      formatter={(value: number) => [`${value.toFixed(2)}R`, 'Cumulative Performance']}
                     />
-                    <ReferenceLine y={0} stroke="#ffffff20" />
-                    <Line 
+                    <Area 
                       type="monotone" 
-                      dataKey="total" 
-                      stroke="#3b82f6" 
-                      strokeWidth={4} 
-                      dot={false}
+                      dataKey="value" 
+                      stroke="#10b981" 
+                      strokeWidth={3} 
+                      fillOpacity={1} 
+                      fill="url(#equityGradient)" 
                       animationDuration={1500}
                     />
-                  </LineChart>
+                  </AreaChart>
                 </ResponsiveContainer>
               </div>
             </div>

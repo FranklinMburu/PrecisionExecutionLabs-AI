@@ -49,7 +49,7 @@ async def get_status():
     chart_len = 100
     slice_start = max(0, len(full_r) - chart_len)
     r_slice = full_r[slice_start:]
-    baseline = sum(full_r[:slice_start])
+    baseline = sum(t['r'] if isinstance(t, dict) else t for t in full_r[:slice_start])
 
     return {
         "engine": {

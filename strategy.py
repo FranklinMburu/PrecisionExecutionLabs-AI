@@ -194,9 +194,10 @@ class StraddleStrategy:
                 self.save_state()
 
     def calculate_std_r(self):
-        if len(self.r_values) < 2: return 0.0
-        mean = sum(self.r_values) / len(self.r_values)
-        variance = sum((x - mean) ** 2 for x in self.r_values) / len(self.r_values)
+        r_list = [t['r'] if isinstance(t, dict) else t for t in self.r_values]
+        if len(r_list) < 2: return 0.0
+        mean = sum(r_list) / len(r_list)
+        variance = sum((x - mean) ** 2 for x in r_list) / len(r_list)
         return math.sqrt(variance)
 
     def calculate_expectancy(self):
@@ -341,7 +342,14 @@ class StraddleStrategy:
         
         self.stats["total_trades"] += 1
         self.stats["total_r"] += r_multiple
-        self.r_values.append(r_multiple)
+        
+        trade_record = {
+            "r": r_multiple,
+            "pnl": total_p,
+            "time": time.time() * 1000, # ms for JS
+            "symbol": self.connector.symbol
+        }
+        self.r_values.append(trade_record)
         
         if total_p > 0:
             self.stats["wins"] += 1
