@@ -57,16 +57,17 @@ class MT5Connector:
             
         import config
         print("🔌 Connecting to MT5...")
+        # Attempt to initialize with credentials
         if not mt5.initialize(
             login=config.MT5_LOGIN, 
             password=config.MT5_PASSWORD, 
             server=config.MT5_SERVER
         ):
-            print(f"initialize() failed, falling back to Simulation Mode.")
-            self.mock_mode = True
-            self.connected = True
-            return True
+            print(f"❌ initialize() failed, error code = {mt5.last_error()}")
+            print("Note: This library requires Windows and a local MT5 Terminal.")
+            return False
         
+        print(f"✅ MT5 Connected Successfully to {config.MT5_SERVER} (Account: {config.MT5_LOGIN})")
         self.connected = True
         return True
 
@@ -75,16 +76,61 @@ class MT5Connector:
             self.point = 0.0001
             return self.symbol
             
+        print(f"🔍 Resolving symbol: {self.symbol}...")
         symbol_info = mt5.symbol_info(self.symbol)
         if symbol_info is None:
-            # Fallback logic simplified for speed in API mode
-            self.symbol = self.symbol # Keep original
+            print(f"  ⚠️  {self.symbol} not found, searching for alternatives...")
             
-        mt5.symbol_select(self.symbol, True)
+            # Try common variants first (faster than getting all symbols)
+            variants = [
+                f"{self.symbol}m",
+                f"{self.symbol}.m",
+                f"{self.symbol}v", 
+                f"{self.symbol}.v",
+                f"{self.symbol}vcn",
+                f"{self.symbol}.vcn"
+            ]
+            
+            found = False
+            for variant in variants:
+                print(f"    Trying: {variant}...")
+                sym_info = mt5.symbol_info(variant)
+                if sym_info is not None and sym_info.trade_mode != mt5.SYMBOL_TRADE_MODE_DISABLED:
+                    self.symbol = variant
+                    found = True
+                    print(f"    ✅ Found: {variant}")
+                    break
+            
+            if not found:
+                print(f"  ⚠️  No variants found, getting all symbols...")
+                symbols = mt5.symbols_get()
+                base = self.symbol.replace(".m", "").replace(".v", "").replace(".vcn", "")
+                matches = [s for s in symbols if base in s.name and (s.visible or s.select)]
+                
+                if matches:
+                    tradable = [m for m in matches if m.trade_mode != mt5.SYMBOL_TRADE_MODE_DISABLED]
+                    if tradable:
+                        self.symbol = tradable[0].name
+                    else:
+                        self.symbol = matches[0].name
+                    print(f"  ✅ Fallback selected: {self.symbol}")
+                else:
+                    print(f"  ❌ Error: No symbols found matching {base}.")
+                    return None
+        
+        # Ensure symbol is active in Market Watch
+        print(f"  📡 Enabling symbol in Market Watch...")
+        if not mt5.symbol_select(self.symbol, True):
+            print(f"  ⚠️  Warning: Could not select {self.symbol}")
+        
         info = mt5.symbol_info(self.symbol)
-        if info:
-            self.point = info.point
-            self.digits = info.digits
+        if info is None:
+            print(f"  ❌ Critical error: could not fetch info for {self.symbol}")
+            return None
+            
+        self.point = info.point
+        self.digits = info.digits
+        print(f"  ✅ Symbol resolved to: {self.symbol} (Point: {self.point})")
         return self.symbol
 
     def get_tick(self):

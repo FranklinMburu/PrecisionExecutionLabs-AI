@@ -498,7 +498,7 @@ class StraddleStrategy:
         profit_points = abs(live_price - self.active_trade['entry'])
         r_multiple = profit_points / r_dist_val
 
-        # At 1R: Partial close 50% and move to Breakeven
+        # 1. 1R PARTIAL CLOSE (Primary Risk Off)
         if not self.active_trade['partial_closed'] and r_multiple >= 1.0:
             current_vol = self.connector.get_position_filled_volume(pos.ticket)
             if current_vol <= 0: current_vol = pos.volume 
@@ -511,29 +511,30 @@ class StraddleStrategy:
             if res_close:
                 self.active_trade['partial_closed'] = True
                 if res_mod: self.active_trade['breakeven_moved'] = True
+            else:
+                self.active_trade['failure_count'] = self.active_trade.get('failure_count', 0) + 1
             self.save_state()
 
-        # Progression Trailing
+        # 2. PROGRESSION TRAILING (Step Logic)
         if self.active_trade['partial_closed']:
-            new_sl = 0.0
-            move_sl = False
+            new_step_sl = 0.0
+            move_step_sl = False
             
+            # Simple steps if momentum isn't explosive
             if r_multiple >= 1.5 and r_multiple < 2.0:
-                # Move to +0.5R
-                new_sl = self.active_trade['entry'] + (0.5 * r_dist_val) if self.active_trade['type'] == "BUY" else self.active_trade['entry'] - (0.5 * r_dist_val)
-                move_sl = True
+                new_step_sl = self.active_trade['entry'] + (0.5 * r_dist_val) if self.active_trade['type'] == "BUY" else self.active_trade['entry'] - (0.5 * r_dist_val)
+                move_step_sl = True
             elif r_multiple >= 2.0:
-                # Move to +1.2R
-                new_sl = self.active_trade['entry'] + (1.2 * r_dist_val) if self.active_trade['type'] == "BUY" else self.active_trade['entry'] - (1.2 * r_dist_val)
-                move_sl = True
+                new_step_sl = self.active_trade['entry'] + (1.2 * r_dist_val) if self.active_trade['type'] == "BUY" else self.active_trade['entry'] - (1.2 * r_dist_val)
+                move_step_sl = True
                 
-            if move_sl:
-                is_better = (new_sl > pos.sl) if self.active_trade['type'] == "BUY" else (new_sl < pos.sl or pos.sl == 0)
+            if move_step_sl:
+                is_better = (new_step_sl > pos.sl) if self.active_trade['type'] == "BUY" else (new_step_sl < pos.sl or pos.sl == 0)
                 if is_better:
-                    self.add_log(f"Trailing Progression: SL to {new_sl:.5f} ({r_multiple:.2f}R)")
-                    self.connector.modify_position(pos.ticket, new_sl, pos.tp)
+                    # self.add_log(f"Trailing Progression: SL to {new_step_sl:.5f} ({r_multiple:.2f}R)")
+                    self.connector.modify_position(pos.ticket, new_step_sl, pos.tp)
 
-        # 3. INTELLIGENT TRAILING STOP ENGINE (Optional/Advanced)
+        # 3. INTELLIGENT TRAILING STOP ENGINE (Primary Active Trailing)
         # Activation: Only trail if min profit R is reached AND one leg has been purged (oco_lock)
         is_trail_active = getattr(config, 'TRAILING_STOP_ENABLE', False)
         if is_trail_active and self.oco_lock and r_multiple >= getattr(config, 'TRAILING_STOP_MIN_PROFIT_R', 0.5):
@@ -566,7 +567,9 @@ class StraddleStrategy:
                 # Volatility Adaptation
                 if self.avg_candle_body > 0:
                     vol_ratio = atr / self.avg_candle_body
-                    vol_mult = max(0.7, min(1.8, vol_ratio)) # High vol = widen (safety), Low vol = tighten
+                else:
+                    vol_ratio = 1.0
+                vol_mult = max(0.7, min(1.8, vol_ratio)) # High vol = widen (safety), Low vol = tighten
 
                 # 3. Breakout Confirmation Rule (Anti-Spike Filter)
                 # Only "accept" the new highest_price if price is above the last 1min high/low + buffer
@@ -616,76 +619,28 @@ class StraddleStrategy:
                 self.active_trade['last_trail_time'] = time.time()
                 self.save_state()
 
-        # 4. Take Profit Management (Institutional Grade Trailing)
+        # 4. TAKE PROFIT TRAILING (Momentum Expansion)
         if hasattr(config, 'TP_TRAILING_ENABLE') and config.TP_TRAILING_ENABLE and self.active_trade['partial_closed']:
             if r_multiple >= config.TP_TRAILING_START_R:
-                # Maintain a buffer between live price and TP to 'ride' the expansion
                 tp_buffer = 1.0 * r_dist_val # Maintain 1R breathing room
+                new_tp = (live_price + tp_buffer) if self.active_trade['type'] == "BUY" else (live_price - tp_buffer)
                 
-                new_tp = 0.0
-                if self.active_trade['type'] == "BUY":
-                    new_tp = live_price + tp_buffer
-                else:
-                    new_tp = live_price - tp_buffer
-                
-                # Check if movement is significant and moves TP further away
                 is_farther = (new_tp > pos.tp) if self.active_trade['type'] == "BUY" else (new_tp < pos.tp or pos.tp == 0)
                 move_dist = abs(new_tp - pos.tp) if pos.tp > 0 else 999
                 
                 if is_farther and move_dist >= (config.TP_TRAILING_STEP_R * r_dist_val):
-                    self.add_log(f"TP TRAIL: Extending TP to {new_tp:.5f} (Momentum detected at {r_multiple:.2f}R)")
+                    self.add_log(f"TP TRAIL: Extending TP to {new_tp:.5f} ({r_multiple:.2f}R)")
                     self.connector.modify_position(pos.ticket, pos.sl, new_tp)
-                    # Update state to reflect new TP
                     self.active_trade['tp'] = new_tp
                     self.save_state()
 
-        # Velocity-aware ladder thresholds
-        if momentum_ratio > 0.3:
-            l1_val, l2_val = 0.5, 1.2
-        else:
-            l1_val, l2_val = 0.3, 0.8
-
-        if self.active_trade['partial_closed']:
-            if r_multiple >= 1.5 and r_multiple < 2.0:
-                new_sl = self.active_trade['entry'] + (l1_val * r_dist_val) if self.active_trade['type'] == "BUY" else self.active_trade['entry'] - (l1_val * r_dist_val)
-                if (self.active_trade['type'] == "BUY" and new_sl > pos.sl) or (self.active_trade['type'] == "SELL" and (pos.sl == 0 or new_sl < pos.sl)):
-                    print(f"Velocity Trailing ({momentum_ratio:.2f} momentum) → SL to +{l1_val}R")
-                    res = self.connector.modify_position(pos.ticket, new_sl, pos.tp)
-                    if not res: self.active_trade['failure_count'] = self.active_trade.get('failure_count', 0) + 1
-            elif r_multiple >= 2.0:
-                new_sl = self.active_trade['entry'] + (l2_val * r_dist_val) if self.active_trade['type'] == "BUY" else self.active_trade['entry'] - (l2_val * r_dist_val)
-                if (self.active_trade['type'] == "BUY" and new_sl > pos.sl) or (self.active_trade['type'] == "SELL" and (pos.sl == 0 or new_sl < pos.sl)):
-                    print(f"Velocity Trailing ({momentum_ratio:.2f} momentum) → SL to +{l2_val}R")
-                    res = self.connector.modify_position(pos.ticket, new_sl, pos.tp)
-                    if not res: self.active_trade['failure_count'] = self.active_trade.get('failure_count', 0) + 1
-
-        # Partial Close
-        if not self.active_trade['partial_closed'] and r_multiple >= 1.0:
-            current_vol = self.connector.get_position_filled_volume(pos.ticket)
-            if current_vol <= 0: current_vol = pos.volume # fallback
-            
-            half_vol = self.connector.round_volume(current_vol / 2)
-            print(f"Partial Close ({half_vol}) at 1R.")
-            res_close = self.connector.close_position(pos.ticket, pos.type, half_vol)
-            res_mod = self.connector.modify_position(pos.ticket, self.active_trade['entry'], pos.tp)
-            
-            if res_close:
-                self.active_trade['partial_closed'] = True
-                if res_mod:
-                    self.active_trade['breakeven_moved'] = True
-                else:
-                    self.active_trade['failure_count'] = self.active_trade.get('failure_count', 0) + 1
-            else:
-                 self.active_trade['failure_count'] = self.active_trade.get('failure_count', 0) + 1
-                 
-            self.save_state()
-            
-        # Stuck Position final check
+        # 5. STUCK POSITION GUARD
         if self.active_trade.get('failure_count', 0) >= config.STUCK_POSITION_THRESHOLD:
-            print(f"STUCK POSITION DETECTED (Failures: {self.active_trade['failure_count']}) → Flattening.")
+            self.add_log(f"CRITICAL: Stuck position detected ({self.active_trade['failure_count']} fails) → Purging.")
             self.connector.close_position(pos.ticket, pos.type, pos.volume)
             self.system_halted = True
             self.save_state()
+
 
     def emergency_resolution(self, positions):
         print("ALERT: DOUBLE FILL DETECTED (BUY & SELL BOTH LIVE) → Emergency Resolution.")

@@ -1,26 +1,13 @@
 import os
+from dotenv import load_dotenv
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-def get_int_env(key, default):
-    val = os.getenv(key, "")
-    if val == "" or val is None:
-        return default
-    try:
-        return int(val)
-    except ValueError:
-        return default
+load_dotenv()
 
 # MT5 CREDENTIALS
-MT5_LOGIN = get_int_env("MT5_LOGIN", 0)
+MT5_LOGIN = int(os.getenv("MT5_LOGIN", 0))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER = os.getenv("MT5_SERVER", "")
-MT5_SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSD")
-SYMBOL = MT5_SYMBOL
+SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSD")
 MAGIC_NUMBER = 123456
 LOOP_SLEEP = 0.5
 

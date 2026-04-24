@@ -89,6 +89,17 @@ export default function App() {
     }
   };
 
+  const handleReset = async () => {
+    try {
+      const response = await fetch('/api/reset', { method: 'POST' });
+      if (response.ok) {
+        fetchStatus();
+      }
+    } catch (err) {
+      console.error("Reset failed", err);
+    }
+  };
+
   useEffect(() => {
     fetchStatus();
     const interval = setInterval(fetchStatus, 1000);
@@ -176,6 +187,28 @@ export default function App() {
             >
               <AlertTriangle className="w-6 h-6 animate-pulse" />
               <p className="font-bold uppercase tracking-widest text-xs">{error}</p>
+            </motion.div>
+          )}
+          {data?.engine.system_halted && (
+            <motion.div 
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="bg-rose-500 border border-rose-600 px-6 py-4 rounded-2xl flex items-center justify-between text-white mb-8 shadow-lg shadow-rose-500/20"
+            >
+              <div className="flex items-center gap-4">
+                <AlertTriangle className="w-6 h-6" />
+                <div>
+                  <p className="font-black uppercase tracking-tight text-sm">System Halted: Max Drawdown Triggered</p>
+                  <p className="text-[10px] font-bold opacity-80 uppercase tracking-widest">Trading logic is currently disabled due to risk breach.</p>
+                </div>
+              </div>
+              <button 
+                onClick={handleReset}
+                className="bg-white text-rose-600 px-6 py-2 rounded-xl font-black text-xs uppercase tracking-widest hover:scale-105 transition-transform active:scale-95 shadow-xl"
+              >
+                Reset & Resume
+              </button>
             </motion.div>
           )}
         </AnimatePresence>

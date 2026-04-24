@@ -83,6 +83,28 @@ async def get_status():
         "logs": strategy.logs
     }
 
+@app.get("/api/stats")
+async def get_stats():
+    return {
+        "stats": strategy.stats,
+        "expectancy": strategy.calculate_expectancy(),
+        "std_r": strategy.calculate_std_r(),
+        "r_values": strategy.r_values,
+        "system_halted": strategy.system_halted,
+        "max_drawdown": strategy.max_drawdown_observed,
+        "consecutive_losses": strategy.consecutive_losses
+    }
+
+@app.post("/api/reset")
+async def reset_system():
+    strategy.system_halted = False
+    strategy.peak_equity = 0.0 # Reset peak to current for fresh drawdown tracking
+    strategy.max_drawdown_observed = 0.0
+    strategy.risk_multiplier = 1.0
+    strategy.save_state()
+    strategy.add_log("USER ACTION: System Overriden & Reset.")
+    return {"status": "reset_complete"}
+
 if __name__ == "__main__":
     # Get port from env (Vite proxy expects 8000)
     port = int(os.getenv("PYTHON_API_PORT", 8000))
