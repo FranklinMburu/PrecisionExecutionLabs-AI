@@ -67,6 +67,7 @@ interface EngineStatus {
     expectancy: number;
     std_r: number;
     r_values: number[];
+    r_baseline: number;
   };
   active_trade: any | null;
   active_trade_meta: any;
@@ -107,12 +108,19 @@ export default function App() {
   }, []);
 
   const chartData = useMemo(() => {
-    return (data?.performance.r_values || []).map((val, i) => ({
-      index: i,
-      r: val,
-      total: (data?.performance.r_values.slice(0, i + 1).reduce((a, b) => a + b, 0) || 0)
-    }));
-  }, [data?.performance.r_values]);
+    const values = data?.performance.r_values || [];
+    const baseline = data?.performance.r_baseline || 0;
+    let runningTotal = baseline;
+    
+    return values.map((val, i) => {
+      runningTotal += val;
+      return {
+        index: i,
+        r: val,
+        total: runningTotal
+      };
+    });
+  }, [data?.performance.r_values, data?.performance.r_baseline]);
 
   if (!data && !error) {
     return (
@@ -163,14 +171,25 @@ export default function App() {
              <EngineTag label="EXEC" active={data?.engine.execution_lock} color="amber" />
              <EngineTag label="SHOCK" active={data?.engine.shock_mode} color="purple" />
              <div className="w-px h-8 bg-white/5 mx-2" />
-             <div className="text-right">
-               <p className="text-[10px] uppercase font-bold text-slate-500 tracking-tighter leading-none">Latency</p>
-               <p className={cn(
-                 "text-sm font-black",
-                 (data?.engine.latency || 0) > 0.5 ? "text-rose-500" : "text-emerald-500"
-               )}>
-                 {(data?.engine.latency || 0).toFixed(3)}s
-               </p>
+             <div className="flex items-center gap-3">
+               {(data?.engine.latency || 0) > 0.5 && (
+                 <motion.div 
+                   animate={{ scale: [1, 1.2, 1], opacity: [0.5, 1, 0.5] }}
+                   transition={{ duration: 1, repeat: Infinity }}
+                   className="text-rose-500"
+                 >
+                   <AlertTriangle className="w-5 h-5 fill-rose-500/20" />
+                 </motion.div>
+               )}
+               <div className="text-right">
+                 <p className="text-[10px] uppercase font-bold text-slate-500 tracking-tighter leading-none">Latency</p>
+                 <p className={cn(
+                   "text-sm font-black transition-colors duration-300",
+                   (data?.engine.latency || 0) > 0.5 ? "text-rose-500 drop-shadow-[0_0_8px_rgba(244,63,94,0.4)]" : "text-emerald-500"
+                 )}>
+                   {(data?.engine.latency || 0).toFixed(3)}s
+                 </p>
+               </div>
              </div>
           </div>
         </div>
@@ -211,11 +230,25 @@ export default function App() {
               </button>
             </motion.div>
           )}
+          {(data?.engine.latency || 0) > 0.5 && (
+            <motion.div 
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="bg-amber-500 border border-amber-600 px-6 py-3 rounded-2xl flex items-center gap-4 text-amber-950 mb-8 shadow-lg shadow-amber-500/10"
+            >
+              <Activity className="w-5 h-5 animate-pulse" />
+              <div>
+                <p className="font-black uppercase tracking-tight text-xs">High Execution Latency Detected ({(data?.engine.latency || 0).toFixed(3)}s)</p>
+                <p className="text-[9px] font-bold opacity-80 uppercase tracking-widest">Orders may experience significant slippage or rejection.</p>
+              </div>
+            </motion.div>
+          )}
         </AnimatePresence>
 
         <div className="grid grid-cols-12 gap-8">
           {/* Key Stats Row */}
-          <div className="col-span-12 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+          <div className="col-span-12 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
             <MetricBox 
               label="Equity" 
               value={`$${data?.account.equity.toLocaleString()}`} 
@@ -229,6 +262,7 @@ export default function App() {
               icon={<ShieldCheck className="w-4 h-4" />} 
               sub={`Limit: ${(0.05 * 100).toFixed(0)}%`}
               color={ (data?.account.total_risk_pct || 0) > 4 ? "rose" : "emerald" }
+              alert={ (data?.account.total_risk_pct || 0) > 4.5 }
             />
             <MetricBox 
               label="Win Rate" 
@@ -243,6 +277,14 @@ export default function App() {
               icon={<Gauge className="w-4 h-4" />} 
               sub={`Std Dev: ${data?.performance.std_r.toFixed(2)}`}
               color={ (data?.performance.expectancy || 0) > 0 ? "emerald" : "rose" }
+            />
+            <MetricBox 
+              label="Latency" 
+              value={`${(data?.engine.latency || 0).toFixed(3)}s`} 
+              icon={<Zap className="w-4 h-4" />} 
+              sub={ (data?.engine.latency || 0) > 0.5 ? "CRITICAL LAG" : "OPTIMIZED" }
+              color={ (data?.engine.latency || 0) > 0.5 ? "rose" : "blue" }
+              alert={ (data?.engine.latency || 0) > 0.5 }
             />
           </div>
 
@@ -438,7 +480,7 @@ export default function App() {
   );
 }
 
-function MetricBox({ label, value, icon, sub, color }: any) {
+function MetricBox({ label, value, icon, sub, color, alert }: any) {
   const colors: any = {
     blue: "text-blue-500 bg-blue-500/10 border-blue-500/20",
     emerald: "text-emerald-500 bg-emerald-500/10 border-emerald-500/20",
@@ -448,10 +490,22 @@ function MetricBox({ label, value, icon, sub, color }: any) {
   };
 
   return (
-    <div className="bg-slate-900/60 border border-white/5 p-6 rounded-3xl backdrop-blur-xl">
+    <div className={cn(
+      "bg-slate-900/60 border border-white/5 p-6 rounded-3xl backdrop-blur-xl relative overflow-hidden transition-all duration-500",
+      alert && "ring-1 ring-rose-500/50 bg-rose-500/5"
+    )}>
+      {alert && (
+        <motion.div 
+          className="absolute inset-0 bg-rose-500/5 pointer-events-none"
+          animate={{ opacity: [0, 1, 0] }}
+          transition={{ duration: 2, repeat: Infinity }}
+        />
+      )}
       <div className="flex items-center justify-between mb-4">
         <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">{label}</p>
-        <div className={cn("p-2 rounded-xl border", colors[color])}>{icon}</div>
+        <div className={cn("p-2 rounded-xl border transition-all duration-500", colors[color], alert && "scale-110 shadow-[0_0_15px_rgba(244,63,94,0.3)]")}>
+          {alert ? <AlertTriangle className="w-4 h-4 animate-pulse" /> : icon}
+        </div>
       </div>
       <div>
         <h4 className="text-2xl font-black text-white tracking-widest">{value}</h4>

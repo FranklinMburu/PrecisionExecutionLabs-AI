@@ -45,6 +45,12 @@ async def get_status():
     acc = connector.get_account()
     tick = connector.get_tick()
     
+    full_r = strategy.r_values
+    chart_len = 100
+    slice_start = max(0, len(full_r) - chart_len)
+    r_slice = full_r[slice_start:]
+    baseline = sum(full_r[:slice_start])
+
     return {
         "engine": {
             "symbol": connector.symbol,
@@ -75,7 +81,8 @@ async def get_status():
         "performance": {
             "expectancy": strategy.calculate_expectancy(),
             "std_r": strategy.calculate_std_r(),
-            "r_values": strategy.r_values[-20:] # Last 20 for chart
+            "r_values": r_slice,
+            "r_baseline": baseline
         },
         "active_trade": strategy.active_trade,
         "active_trade_meta": strategy.active_trade_meta,

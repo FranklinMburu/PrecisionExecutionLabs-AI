@@ -134,6 +134,7 @@ class MT5Connector:
         return self.symbol
 
     def get_tick(self):
+        start_time = time.time()
         if self.mock_mode:
             self._mock_price += random.uniform(-0.0002, 0.0002)
             class Tick: pass
@@ -141,10 +142,14 @@ class MT5Connector:
             t.bid = self._mock_price
             t.ask = self._mock_price + 0.0001
             t.time = int(time.time())
+            self.last_latency = (time.time() - start_time) + random.uniform(0.01, 0.05)
             return t
-        return mt5.symbol_info_tick(self.symbol)
+        tick = mt5.symbol_info_tick(self.symbol)
+        self.last_latency = time.time() - start_time
+        return tick
 
     def get_m1_candles(self, count):
+        start_time = time.time()
         if self.mock_mode:
             import numpy as np
             # Generate fake M1 candles
@@ -152,11 +157,16 @@ class MT5Connector:
             lows = [self._mock_price - random.uniform(0.0005, 0.0010) for _ in range(count)]
             opens = [self._mock_price + random.uniform(-0.0005, 0.0005) for _ in range(count)]
             closes = [self._mock_price + random.uniform(-0.0005, 0.0005) for _ in range(count)]
-            return np.array(list(zip(opens, highs, lows, closes)), dtype=[('open', 'f8'), ('high', 'f8'), ('low', 'f8'), ('close', 'f8')])
+            candles = np.array(list(zip(opens, highs, lows, closes)), dtype=[('open', 'f8'), ('high', 'f8'), ('low', 'f8'), ('close', 'f8')])
+            self.last_latency = (time.time() - start_time) + random.uniform(0.02, 0.08)
+            return candles
             
-        return mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M1, 1, count)
+        candles = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M1, 1, count)
+        self.last_latency = time.time() - start_time
+        return candles
 
     def place_order(self, order_type, price, sl, tp, lot, deviation=10):
+        start_time = time.time()
         if self.trade_lock: return None
         self.trade_lock = True
         
@@ -191,6 +201,7 @@ class MT5Connector:
             r = Res()
             r.retcode = 10009 # DONE
             r.order = ticket
+            self.last_latency = (time.time() - start_time) + random.uniform(0.1, 0.3)
             return r
 
         try:
@@ -209,6 +220,7 @@ class MT5Connector:
                 "type_filling": mt5.ORDER_FILLING_RETURN,
             }
             res = mt5.order_send(request)
+            self.last_latency = time.time() - start_time
             if res is None:
                 print(f"MT5: order_send returned None. Check terminal connection / logs.")
             return res
