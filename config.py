@@ -6,8 +6,17 @@ try:
 except ImportError:
     pass
 
+def get_int_env(key, default):
+    val = os.getenv(key, "")
+    if val == "" or val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
 # MT5 CREDENTIALS
-MT5_LOGIN = int(os.getenv("MT5_LOGIN", 0))
+MT5_LOGIN = get_int_env("MT5_LOGIN", 0)
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER = os.getenv("MT5_SERVER", "")
 MT5_SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSD")

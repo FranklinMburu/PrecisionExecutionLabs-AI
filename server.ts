@@ -8,7 +8,11 @@ async function startServer() {
   const PORT = 3000;
 
   console.log("🚀 Starting MT5 Trading Engine (Python)...");
-  const pythonProcess = spawn("python3", ["main.py"], {
+  
+  // Robust python detection
+  const pythonCmd = process.platform === "win32" ? "python" : "python3";
+  
+  const pythonProcess = spawn(pythonCmd, ["main.py"], {
     stdio: "inherit",
     env: { ...process.env, PYTHONUNBUFFERED: "1" }
   });
