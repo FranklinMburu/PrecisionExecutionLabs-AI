@@ -1,5 +1,11 @@
 import os
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # MT5 CREDENTIALS
 MT5_LOGIN = int(os.getenv("MT5_LOGIN", 0))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
@@ -22,6 +28,14 @@ MIN_EXPECTANCY_THRESHOLD = 0.0 # Must be positive
 VALIDATION_WINDOW = 30         # First check trades
 CYCLE_WINDOW = 50              # Recurring check trades
 STUCK_POSITION_THRESHOLD = 5   # Max retries before emergency evacuation
+
+# STRATEGY TUNING
+RANGE_LOOKBACK = 6
+BUFFER_POINTS = 60
+TP_RATIO = 3.0                 # Target 3R
+TP_TRAILING_ENABLE = True
+TP_TRAILING_START_R = 2.0      # When to start pushing TP further
+TP_TRAILING_STEP_R = 1.0       # How much to push TP by
 
 # MARKET FILTERS
 MIN_RANGE_POINTS = 200         # Filter out "dead" markets

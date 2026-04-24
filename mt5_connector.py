@@ -32,6 +32,7 @@ class MT5Connector:
         self.symbol = symbol
         self.magic = magic
         self.point = 0.0001
+        self.digits = 5
         self.trade_lock = False
         self.last_latency = 0.0
         self.connected = False
@@ -83,6 +84,7 @@ class MT5Connector:
         info = mt5.symbol_info(self.symbol)
         if info:
             self.point = info.point
+            self.digits = info.digits
         return self.symbol
 
     def get_tick(self):
@@ -112,15 +114,18 @@ class MT5Connector:
         if self.trade_lock: return None
         self.trade_lock = True
         
+        # Ensure volume is rounded correctly
+        lot = self.round_volume(lot)
+        
         if self.mock_mode:
             ticket = random.randint(1000000, 9999999)
             class Order:
                 def __init__(self, ticket, magic, price, sl, tp, lot, order_type):
                     self.ticket = ticket
                     self.magic = magic
-                    self.price_open = price
-                    self.sl = sl
-                    self.tp = tp
+                    self.price_open = round(price, 5)
+                    self.sl = round(sl, 5)
+                    self.tp = round(tp, 5)
                     self.volume = lot
                     self.type = order_type
                 def _asdict(self):
@@ -142,25 +147,28 @@ class MT5Connector:
             r.order = ticket
             return r
 
-        # ... (rest of the original place_order logic)
         try:
-            import config
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": self.symbol,
-                "volume": lot,
+                "volume": float(lot),
                 "type": order_type,
-                "price": round(price, 5),
-                "sl": round(sl, 5),
-                "tp": round(tp, 5),
-                "deviation": deviation,
-                "magic": self.magic,
+                "price": float(round(price, self.digits)),
+                "sl": float(round(sl, self.digits)),
+                "tp": float(round(tp, self.digits)),
+                "deviation": int(deviation),
+                "magic": int(self.magic),
                 "comment": "Straddle Engine",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_RETURN,
             }
             res = mt5.order_send(request)
+            if res is None:
+                print(f"MT5: order_send returned None. Check terminal connection / logs.")
             return res
+        except Exception as e:
+            print(f"MT5 Exception in place_order: {e}")
+            return None
         finally:
             self.trade_lock = False
 
@@ -173,15 +181,26 @@ class MT5Connector:
         if self.mock_mode: return self._mock_orders
         return mt5.orders_get(symbol=self.symbol)
 
-    def cancel_order(self, ticket):
+    def cancel_order(self, ticket, retries=3):
         if self.mock_mode:
             self._mock_orders = [o for o in self._mock_orders if o.ticket != ticket]
             class Res: pass
             r = Res()
-            r.retcode = 10009
+            r.retcode = mt5.TRADE_RETCODE_DONE
             return r
+            
         request = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
-        return mt5.order_send(request)
+        
+        for attempt in range(retries):
+            res = mt5.order_send(request)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                return res
+            
+            print(f"MT5: Cancel Order {ticket} failed (Attempt {attempt+1}/{retries}). Retcode: {res.retcode if res else 'None'}")
+            if attempt < retries - 1:
+                time.sleep(0.1) # Brief backoff
+                
+        return res
 
     def cancel_all_pending(self):
         if self.mock_mode:
@@ -231,8 +250,8 @@ class MT5Connector:
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": ticket,
-            "sl": round(sl, 5),
-            "tp": round(tp, 5)
+            "sl": round(sl, self.digits),
+            "tp": round(tp, self.digits)
         }
         return mt5.order_send(request)
 
@@ -262,8 +281,26 @@ class MT5Connector:
     def round_volume(self, volume):
         step = 0.01
         info = self.get_symbol_info()
-        if info: step = getattr(info, 'volume_step', 0.01)
-        return round(round(volume / step) * step, 2)
+        if info: 
+            step = getattr(info, 'volume_step', 0.01)
+            # Clamp to min/max
+            volume = max(info.volume_min, min(volume, info.volume_max))
+            
+        precision = 2
+        if step < 1:
+            try:
+                # Convert to string and find decimal places
+                s = f"{step:.8f}".rstrip('0')
+                if '.' in s:
+                    precision = len(s.split('.')[-1])
+                else:
+                    precision = 0
+            except:
+                precision = 2
+        else:
+            precision = 0
+            
+        return round(round(volume / step) * step, precision)
 
     def get_history_deals(self, ticket):
         return []

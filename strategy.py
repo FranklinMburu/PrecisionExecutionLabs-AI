@@ -72,7 +72,8 @@ class StraddleStrategy:
             "risk_multiplier": self.risk_multiplier,
             "system_halted": self.system_halted,
             "oco_lock": self.oco_lock,
-            "execution_lock": self.execution_lock
+            "execution_lock": self.execution_lock,
+            "current_range": self.current_range
         }
         try:
             with open(self.state_file, 'w') as f:
@@ -96,6 +97,7 @@ class StraddleStrategy:
                     self.system_halted = state.get("system_halted", False)
                     self.oco_lock = state.get("oco_lock", False)
                     self.execution_lock = state.get("execution_lock", False)
+                    self.current_range = state.get("current_range")
                 print(f"System State Recovered: {self.state_file}")
             except Exception as e:
                 print(f"Persistence Error (Load): {e}")
@@ -126,16 +128,30 @@ class StraddleStrategy:
         # Guard: If equity is extremely low, return minimum lot
         if effective_basis < 10: return sym_info.volume_min 
 
-        current_risk = config.RISK_PER_TRADE * self.risk_multiplier
-        # Worst-case slippage buffer
-        risk_amount = (effective_basis * current_risk) / config.SLIPPAGE_RISK_BUFFER
+        # Risk amount based on equity and risk multiplier
+        current_risk_pct = getattr(config, 'RISK_PER_TRADE_PERCENT', 1.0) / 100
+        risk_amount = effective_basis * current_risk_pct * self.risk_multiplier
+        
+        # Apply slippage factor (Assume actual loss could be 20% worse than SL in news)
+        protected_risk_amount = risk_amount / 1.2 
         
         sl_dist = abs(entry - sl)
         if sl_dist == 0: return sym_info.volume_min
         
-        lot = risk_amount / (sl_dist * sym_info.trade_contract_size)
+        # Standard FX/Metal lot formula: Lot = Risk / (Distance * Contract Size)
+        raw_lot = protected_risk_amount / (sl_dist * sym_info.trade_contract_size)
         
-        print(f"Risk Basis: {effective_basis:.2f} | Risk Amount: {risk_amount:.2f} | Multiplier: {self.risk_multiplier}")
+        # Clamp to broker limits
+        lot = max(sym_info.volume_min, min(raw_lot, sym_info.volume_max))
+        
+        # Margin Check: Ensure we don't use more than 50% of free margin
+        # Estimated margin (simplified assuming leverage 1:30)
+        est_margin = (lot * sym_info.trade_contract_size * entry) / 30
+        if est_margin > acc.margin_free * 0.5:
+             lot = (acc.margin_free * 0.5) / (sym_info.trade_contract_size * entry / 30)
+             lot = max(sym_info.volume_min, lot)
+
+        print(f"Audit: Basis {effective_basis:.2f} | Risk $: {risk_amount:.2f} | Final Lot: {lot}")
         return self.connector.round_volume(lot)
 
     def track_drawdown(self, equity):
@@ -369,10 +385,22 @@ class StraddleStrategy:
     def manage_position(self, pos):
         # 1. IMMEDIATE OCO (Priority #1)
         # Kill all pending orders immediately if a position is live
+        # Enhanced to ensure it keeps trying until all pending magic-matched orders are gone
         if not self.oco_lock:
             self.add_log("OCO: Trigger detected. Purging non-triggered side...")
-            count = self.connector.cancel_all_pending()
-            self.oco_lock = True
+            attempts = 0
+            while attempts < 3:
+                count = self.connector.cancel_all_pending()
+                orders = self.connector.get_orders()
+                matched_orders = [o for o in orders if o.magic == self.connector.magic] if orders else []
+                if not matched_orders:
+                    self.oco_lock = True
+                    break
+                attempts += 1
+                time.sleep(0.05) # Micro-sleep for MT5 state sync
+            
+            if not self.oco_lock:
+                self.add_log("WARNING: OCO failed to clear all pending orders after retries.")
             self.save_state()
 
         tick = self.connector.get_tick()
@@ -387,27 +415,51 @@ class StraddleStrategy:
         # 2. HARD SL ENFORCEMENT (Broker Safety Fix)
         # CRITICAL: This MUST NOT be skipped by latency filters
         if pos.sl == 0:
-            print(f"CRITICAL: Ticket {pos.ticket} has NO SL. Attempting emergency enforcement...")
+            self.add_log(f"CRITICAL: Ticket {pos.ticket} has NO SL. Attempting emergency enforcement...")
+            
+            # Calculate emergency SL based on context
             emergency_sl = self.active_trade_meta.get('range_low') if pos.type == mt5.POSITION_TYPE_BUY else self.active_trade_meta.get('range_high')
+            
+            # Fallback to current range if meta is missing
+            if not emergency_sl and self.current_range:
+                emergency_sl = self.current_range['low'] if pos.type == mt5.POSITION_TYPE_BUY else self.current_range['high']
+            
+            # Absolute last resort fallback (e.g., 500 points)
+            if not emergency_sl:
+                pts = 500 * self.connector.point
+                emergency_sl = pos.price_open - pts if pos.type == mt5.POSITION_TYPE_BUY else pos.price_open + pts
+
             if emergency_sl:
-                # Institutional Loop: Retry 5 times with slight backoff
-                for attempt in range(5):
-                    print(f"Emergency SL Attempt {attempt+1}...")
+                success = False
+                # Institutional Loop: Phase 1 - Try to set SL directly
+                for attempt in range(3):
+                    res_mod = self.connector.modify_position(pos.ticket, emergency_sl, pos.tp)
+                    if res_mod and res_mod.retcode == mt5.TRADE_RETCODE_DONE:
+                        self.add_log(f"Emergency SL applied successfully on attempt {attempt+1}.")
+                        success = True
+                        break
+                    time.sleep(0.1 * (attempt + 1)) # Small linear backoff
+
+                # Phase 2: If Phase 1 failed, reduce exposure and try again
+                if not success:
+                    self.add_log("Emergency SL Phase 1 failed. Reducing exposure by 50%...")
                     half_vol = self.connector.round_volume(real_vol * 0.5)
                     self.connector.close_position(pos.ticket, pos.type, half_vol)
-                    res_mod = self.connector.modify_position(pos.ticket, emergency_sl, pos.tp)
                     
-                    if res_mod and res_mod.retcode == mt5.TRADE_RETCODE_DONE:
-                        print("Emergency SL success.")
-                        break
-                    time.sleep(0.1) # Aggressive retry
-                
-                # Fatal Failure Guard
-                if pos.sl == 0:
-                    self.active_trade['failure_count'] = self.active_trade.get('failure_count', 0) + 1
-                    if self.active_trade['failure_count'] >= config.STUCK_POSITION_THRESHOLD:
-                        print("CRITICAL: SL LOCK FAILURE → Flattening position for safety.")
-                        self.connector.close_position(pos.ticket, pos.type, pos.volume)
+                    for attempt in range(3):
+                        res_mod = self.connector.modify_position(pos.ticket, emergency_sl, pos.tp)
+                        if res_mod and res_mod.retcode == mt5.TRADE_RETCODE_DONE:
+                            self.add_log(f"Emergency SL applied after reduction on attempt {attempt+1}.")
+                            success = True
+                            break
+                        time.sleep(0.2)
+
+                # Phase 3: Fatal Failure Guard - Flatten Everything
+                if not success:
+                    self.add_log("CRITICAL: ALL EMERGENCY SL ATTEMPTS FAILED. Flattening position immediately.")
+                    self.connector.close_position(pos.ticket, pos.type, pos.volume)
+                    self.system_halted = True
+                    self.save_state()
         
         # Latency Awareness: Skip only non-critical updates if lagging
         is_lagging = self.connector.last_latency > 0.8
@@ -475,6 +527,29 @@ class StraddleStrategy:
         profit_points = abs(live_price - self.active_trade['entry'])
         r_multiple = profit_points / r_dist_val
 
+        # 3. Take Profit Management (Institutional Grade Trailing)
+        if hasattr(config, 'TP_TRAILING_ENABLE') and config.TP_TRAILING_ENABLE and self.active_trade['partial_closed']:
+            if r_multiple >= config.TP_TRAILING_START_R:
+                # Maintain a buffer between live price and TP to 'ride' the expansion
+                tp_buffer = 1.0 * r_dist_val # Maintain 1R breathing room
+                
+                new_tp = 0.0
+                if self.active_trade['type'] == "BUY":
+                    new_tp = live_price + tp_buffer
+                else:
+                    new_tp = live_price - tp_buffer
+                
+                # Check if movement is significant and moves TP further away
+                is_farther = (new_tp > pos.tp) if self.active_trade['type'] == "BUY" else (new_tp < pos.tp or pos.tp == 0)
+                move_dist = abs(new_tp - pos.tp) if pos.tp > 0 else 999
+                
+                if is_farther and move_dist >= (config.TP_TRAILING_STEP_R * r_dist_val):
+                    self.add_log(f"TP TRAIL: Extending TP to {new_tp:.5f} (Momentum detected at {r_multiple:.2f}R)")
+                    self.connector.modify_position(pos.ticket, pos.sl, new_tp)
+                    # Update state to reflect new TP
+                    self.active_trade['tp'] = new_tp
+                    self.save_state()
+
         # Velocity-aware ladder thresholds
         if momentum_ratio > 0.3:
             l1_val, l2_val = 0.5, 1.2
@@ -539,8 +614,21 @@ class StraddleStrategy:
         orders = self.connector.get_orders()
         
         matched_positions = [p for p in positions if p.magic == self.connector.magic] if positions else []
+        matched_orders = [o for o in orders if o.magic == self.connector.magic] if orders else []
+        
         has_positions = len(matched_positions) > 0
-        has_orders = (orders and any(o.magic == self.connector.magic for o in orders))
+        has_orders = len(matched_orders) > 0
+
+        # PROACTIVE OCO: Detect fill during the "shadow period" before MT5 reports a position
+        if not has_positions and self.execution_lock and len(matched_orders) == 1 and not self.oco_lock:
+            # Check if we were expecting 2 orders
+            # (Note: we'll update active_trade_meta with the initial count during placement)
+            expected_count = self.active_trade_meta.get('expected_order_count', 0)
+            if expected_count == 2:
+                self.add_log("OCO (Proactive): Pending order missing - likely filled. Purging residual side early.")
+                self.connector.cancel_all_pending()
+                self.oco_lock = True
+                self.save_state()
 
         # Double Fill / Hedge Error Resolution (Institutional upgrade)
         if len(matched_positions) > 1:
@@ -605,7 +693,8 @@ class StraddleStrategy:
             "sell_entry": sell_p,
             "range_high": range_high,
             "range_low": range_low,
-            "order_timestamp": time.time()
+            "order_timestamp": time.time(),
+            "expected_order_count": 2
         }
         self.save_state()
 
