@@ -109,7 +109,16 @@ class StraddleStrategy:
             if acc:
                 self.day_start_balance = acc.balance
                 self.last_day_check = now
+                
+                # If current equity is much lower than peak, but we aren't in a massive trade,
+                # it's likely a withdrawal or account change. Sync peak to avoid false HALT.
+                if self.peak_equity > acc.equity:
+                    print(f"Equity Sync: Adjusting peak {self.peak_equity:.2f} to {acc.equity:.2f} to prevent false drawdown halt.")
+                    self.peak_equity = acc.equity
+                    self.max_drawdown_observed = 0.0
+                
                 print(f"Daily Baseline Reset: {self.day_start_balance:.2f}")
+                self.save_state()
 
     def update_spread_rolling(self, current_spread):
         self.spread_history.append(current_spread)
@@ -219,7 +228,7 @@ class StraddleStrategy:
         if orders:
             for o in orders:
                 if o.magic == self.connector.magic and o.sl > 0:
-                    risk = abs(o.price_open - o.sl) * o.volume * sym_info.trade_contract_size
+                    risk = abs(o.price_open - o.sl) * o.volume_initial * sym_info.trade_contract_size
                     total_risk += (risk * config.SLIPPAGE_RISK_BUFFER)
                         
         return total_risk / acc.balance
@@ -482,7 +491,7 @@ class StraddleStrategy:
             entry_buffer = self.active_trade_meta.get('buffer_size', 100)
             price_buffer = entry_buffer * self.connector.point
             
-            if self.current_range:
+            if self.current_range and 'high' in self.current_range and 'low' in self.current_range:
                 if self.active_trade['type'] == "BUY" and last_closed < (self.current_range['high'] - price_buffer):
                     self.add_log("Fake breakout detected → Exit trade.")
                     self.connector.close_position(pos.ticket, pos.type, pos.volume)
@@ -786,19 +795,15 @@ class StraddleStrategy:
         
         if res_buy and res_sell:
             self.execution_lock = True
-            self.add_log(f"Straddle Placed: {lot} lots @ {buy_p:.5f} / {sell_p:.5f}")
+            self.add_log(f"EXEC: Pending straddle placed (Size: {lot} lots @ {buy_p:.5f} / {sell_p:.5f})")
             self.save_state()
-        print(f"BUY STOP @ {buy_p:.2f} | SL: {range_low:.2f}")
-        print(f"SELL STOP @ {sell_p:.2f} | SL: {range_high:.2f}")
-        print(f"Spread: {spread_pts:.0f} | Risk: {self.risk_multiplier*100:.0f}% | LOT: {lot}")
-        
-        # Internal Execution Lock
-        self.execution_lock = True
-        self.save_state()
-        
-        self.connector.place_order(mt5.ORDER_TYPE_BUY_STOP, buy_p, range_low, buy_p + (buy_p-range_low)*3, lot, deviation=dev)
-        self.connector.place_order(mt5.ORDER_TYPE_SELL_STOP, sell_p, range_high, sell_p - (range_high-sell_p)*3, lot, deviation=dev)
-        self.add_log(f"EXEC: Pending straddle placed (Size: {lot})")
+            print(f"BUY STOP @ {buy_p:.2f} | SL: {buy_sl:.2f} | TP: {buy_tp:.2f}")
+            print(f"SELL STOP @ {sell_p:.2f} | SL: {sell_sl:.2f} | TP: {sell_tp:.2f}")
+            print(f"Spread: {spread_pts:.0f} | Risk: {self.risk_multiplier*100:.0f}% | LOT: {lot}")
+        else:
+            print("ERROR: Failed to place straddle orders.")
+            self.execution_lock = False
+            return
 
         # Post-placement Verification (Phantom Fill Guard)
         time.sleep(0.5) # Brief pause for MT5 sync
